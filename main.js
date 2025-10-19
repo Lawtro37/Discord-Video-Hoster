@@ -309,6 +309,22 @@ app.get('/v/:id', (req, res) => {
 	const d = readData();
 	if (!d[id]) return sendInvalidEmbed(req, res);
 
+	// If this item has been marked removed, serve the public/Removed.png image instead.
+	if (d[id].removed) {
+		const removedImg = path.join(__dirname, 'public', 'Removed.png');
+		if (fs.existsSync(removedImg)) {
+			const stat = fs.statSync(removedImg);
+			res.setHeader('Content-Type', 'image/png');
+			res.setHeader('Content-Length', stat.size);
+			res.setHeader('Cache-Control', 'public, max-age=60');
+			const stream = fs.createReadStream(removedImg);
+			return stream.pipe(res);
+		} else {
+			// fallback to invalid embed if Removed.png not present
+			return sendInvalidEmbed(req, res);
+		}
+	}
+
 	const filePath = path.join(UPLOADS_DIR, d[id].filename);
 	if (!fs.existsSync(filePath)) return sendInvalidEmbed(req, res);
 
@@ -350,6 +366,8 @@ const server = http.createServer(app);
 
 // Short URL domain configuration. If LAWTON_SHORT_DOMAIN is set, use it; otherwise default to lawton.au
 const SHORT_DOMAIN = process.env.LAWTON_SHORT_DOMAIN || 'lawton.au';
+// Admin token for simple admin panel authentication. Set ADMIN_TOKEN env var to enable.
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
 
 // WebSocket server for realtime transcode updates
 const wss = new WebSocket.Server({ server });
@@ -395,6 +413,87 @@ wss.on('connection', (ws, req) => {
 			if (set) set.delete(ws);
 		}
 	});
+});
+
+// Simple admin auth middleware: expects Authorization: Bearer <ADMIN_TOKEN>
+function adminAuth(req, res, next) {
+	if (!ADMIN_TOKEN) return res.status(403).json({ error: 'admin not configured' });
+	const auth = req.get('authorization') || req.get('Authorization') || '';
+	if (!auth.toLowerCase().startsWith('bearer ')) return res.status(401).json({ error: 'missing token' });
+	const token = auth.slice(7).trim();
+	if (!token || token !== ADMIN_TOKEN) return res.status(403).json({ error: 'invalid token' });
+	next();
+}
+
+// Admin: list videos
+app.get('/admin/list', adminAuth, (req, res) => {
+	try {
+		const d = readData();
+		const out = [];
+		const shortMap = d._short || {};
+		// build reverse map: id -> short
+		const rev = {};
+		for (const [k, v] of Object.entries(shortMap)) rev[v] = k;
+		for (const [id, info] of Object.entries(d)) {
+			if (id === '_short') continue;
+		out.push({ id, originalName: info.originalName, filename: info.filename, size: info.size, createdAt: info.createdAt, converted: info.converted || false, short: rev[id] || null, removed: info.removed || false });
+		}
+		// sort by createdAt desc
+		out.sort((a,b)=> (b.createdAt||0)-(a.createdAt||0));
+		res.json({ ok: true, items: out });
+	} catch (e) { res.status(500).json({ error: e && e.message }); }
+});
+
+// Serve a minimal admin entry page at /admin that prompts for the token and
+// stores it to localStorage, then redirects to the static admin UI (/admin.html).
+app.get('/admin', (req, res) => {
+	const html = `<!doctype html><html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Admin Login</title></head><body>
+	<script>
+		// Prompt for token, save to localStorage as 'admin_token' and navigate to /public/admin.html
+		(async function(){
+			try{
+				let token = localStorage.getItem('admin_token') || '';
+				if (!token) token = prompt('Enter admin token (Bearer token value)');
+				if (token) {
+					localStorage.setItem('admin_token', token);
+					// Redirect to the admin UI which will read token from localStorage
+					window.location.replace('/admin.html');
+				} else {
+					document.body.innerHTML = '<p>No token provided. <a href="/admin.html">Open admin UI</a></p>';
+				}
+			}catch(e){ document.body.innerHTML = '<p>Error: '+(e && e.message)+'</p>'; }
+		})();
+	</script>
+	</body></html>`;
+	res.setHeader('Content-Type','text/html');
+	res.send(html);
+});
+
+// Admin: delete a video by id
+app.post('/admin/delete', adminAuth, express.json(), (req, res) => {
+	try {
+		const id = req.body && req.body.id;
+		if (!id) return res.status(400).json({ error: 'id required' });
+		const d = readData();
+		if (!d[id]) return res.status(404).json({ error: 'not found' });
+		const filename = d[id].filename;
+				// mark as removed in metadata (don't immediately delete file so disk recovery is possible)
+				try {
+					d[id].removed = true;
+				} catch (e) {}
+				// also attempt to delete the file (best-effort) and record if deletion succeeded
+				try { fs.unlinkSync(path.join(UPLOADS_DIR, filename)); d[id].filename = filename; d[id].fileDeleted = true; } catch (e) { d[id].fileDeleted = false; }
+				// remove short mappings that point to this id
+		if (d._short) {
+			for (const [k, v] of Object.entries(d._short)) {
+				if (v === id) delete d._short[k];
+			}
+		}
+	writeData(d);
+		// notify subscribers if any
+	try { transcodeJobs[id] = transcodeJobs[id] || {}; transcodeJobs[id].status = 'removed'; broadcastStatus(id); } catch (e) {}
+		return res.json({ ok: true });
+	} catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
 server.listen(PORT, () => {
@@ -482,8 +581,9 @@ app.get('/info/:id', (req, res) => {
 				if (v === id) { shortCandidate = k; break; }
 			}
 		}
-		const lawtonShort = `https://${SHORT_DOMAIN}/${shortCandidate || id}`;
-		return res.json({ id, videoUrl, shortUrl, lawtonShortUrl: lawtonShort, info: d[id] });
+	const lawtonShort = `https://${SHORT_DOMAIN}/${shortCandidate || id}`;
+	const removedImage = `${protocol}://${host}/public/Removed.png`;
+	return res.json({ id, videoUrl, shortUrl, lawtonShortUrl: lawtonShort, info: d[id], removed: !!d[id].removed, removedImageUrl: removedImage });
 	} catch (e) {
 		return res.json({ id, videoUrl, shortUrl, info: d[id] });
 	}
