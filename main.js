@@ -80,8 +80,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 		let warning = null;
 
 		// If not a supported container, try converting to mp4
-		// Allow .mkv as a served format (many MKV files will still depend on codecs for playback)
-		const supportedExts = new Set(['.mp4', '.mov', '.webm', '.mkv']);
+		// Do NOT include .mkv here so MKV uploads are converted to MP4 for better browser/Discord support
+		const supportedExts = new Set(['.mp4', '.mov', '.webm']);
 			if (!supportedExts.has(finalExt)) {
 				// schedule an asynchronous transcode job and return immediately. Clients can poll /transcode-status/:id
 				const convertedName = id + '.mp4';
