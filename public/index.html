@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Video Hoster</title>
+    <title>Discord Video Hoster</title>
     <style>
       body { font-family: system-ui, Arial; max-width:800px; margin:40px auto; padding:0 20px; }
       .drop { border:2px dashed #888; padding:40px; text-align:center; border-radius:8px; }
@@ -61,10 +61,27 @@
         pct.style.marginTop = '4px';
         pcont.appendChild(bar);
         pcont.appendChild(pct);
+
+        // ETA display
+        const convEta = document.createElement('div');
+        convEta.textContent = '';
+        convEta.style.fontSize = '12px';
+        convEta.style.textAlign = 'right';
+        convEta.style.color = '#333';
+
         links.appendChild(pcont);
-        return { bar, pct };
+
+        // return handles so caller can wire them up
+        return { bar, pct, convEta };
       }
 
+
+      function secondsToHMS(sec){
+        sec = Math.max(0, Math.round(sec || 0));
+        const h = Math.floor(sec/3600); const m = Math.floor((sec%3600)/60); const s = sec%60;
+        if (h>0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+        return `${m}:${String(s).padStart(2,'0')}`;
+      }
       function upload(file){
         const fd = new FormData();
         fd.append('file', file);
@@ -84,9 +101,70 @@
             if (xhr.status >= 200 && xhr.status < 300) {
               try{
                 const j = JSON.parse(xhr.responseText);
-                  renderResults(j);
-                  // if server returned converted=false or job may be running, poll transcode status
-                  pollTranscode(j.id);
+                  // render minimal UI: show upload finished and start polling conversion
+                  renderResultsPlaceholder(j.id);
+                  // try to use websocket subscription for real-time updates
+                  try {
+                    const wsProto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+                    const wsUrl = wsProto + '//' + location.host;
+                    const ws = new WebSocket(wsUrl);
+                    ws.addEventListener('open', ()=>{
+                      ws.send(JSON.stringify({ type: 'subscribe', id: j.id }));
+                    });
+                    ws.addEventListener('message', (m)=>{
+                      try{
+                        const msg = JSON.parse(m.data);
+                        if (msg && msg.type === 'status' && msg.id === j.id){
+                          const job = msg.job || {};
+                          const barEl = document.getElementById('conv-bar-' + j.id);
+                          const pctEl = document.getElementById('conv-pct-' + j.id);
+                          const etaEl = document.getElementById('conv-eta-' + j.id);
+                          const infoEl = document.getElementById('conv-info-' + j.id);
+                          const progress = (typeof job.progress === 'number') ? job.progress : 0;
+                          if (barEl) { barEl.value = progress; try{ barEl.style.accentColor = 'limegreen'; }catch(e){} }
+                          if (pctEl) pctEl.textContent = (job.status === 'done') ? '100%' : (progress + '%');
+                          // Use server-provided ETA (seconds) when available
+                          if (etaEl){
+                            if (typeof job.eta === 'number' && job.eta !== null) {
+                              etaEl.textContent = secondsToHMS(job.eta) + ' left';
+                            } else if (typeof job.duration === 'number' && typeof job.elapsed === 'number') {
+                              const remaining = Math.max(0, Math.round(job.duration - job.elapsed));
+                              etaEl.textContent = secondsToHMS(remaining) + ' left';
+                            } else if (progress > 0 && typeof job.elapsed === 'number'){
+                              const totalEst = Math.round(job.elapsed * (100 / progress));
+                              const remaining = Math.max(0, totalEst - Math.round(job.elapsed));
+                              etaEl.textContent = secondsToHMS(remaining) + ' left';
+                            } else if (progress > 0) {
+                              etaEl.textContent = 'Estimating...';
+                            } else {
+                              etaEl.textContent = '';
+                            }
+                          }
+                          // show only totalFrames if available (remove fps counter as requested)
+                          if (infoEl) {
+                            const parts = [];
+                            if (typeof job.totalFrames === 'number' && job.totalFrames > 0) parts.push('frames ' + job.totalFrames);
+                            infoEl.textContent = parts.join(' • ');
+                          }
+                          if (job.status === 'done'){
+                            ws.send(JSON.stringify({ type: 'unsubscribe', id: j.id }));
+                            showFinalResults(j.id);
+                          }
+                          if (job.status === 'error'){
+                            const convDiv = document.getElementById('conv-status-' + j.id);
+                            if (convDiv) convDiv.innerHTML = `<div style="color:crimson">Conversion error: ${job.message}</div>`;
+                          }
+                        }
+                      }catch(e){}
+                    });
+                    ws.addEventListener('close', ()=>{
+                      // fallback to polling if ws closes unexpectedly
+                      pollTranscode(j.id);
+                    });
+                    ws.addEventListener('error', ()=>{ pollTranscode(j.id); });
+                  } catch (e) {
+                    pollTranscode(j.id);
+                  }
               }catch(e){
                 links.textContent = 'Upload finished but response parse failed';
               }
@@ -110,140 +188,187 @@
         };
       }
 
-      function renderResults(j){
+      function renderResultsPlaceholder(id){
         links.innerHTML = '';
-        const videoP = document.createElement('p');
-        const aVideo = document.createElement('a');
-        aVideo.href = j.videoUrl;
-        aVideo.target = '_blank';
-        aVideo.textContent = j.videoUrl;
-        videoP.appendChild(document.createTextNode('Video URL: '));
-        videoP.appendChild(aVideo);
-        links.appendChild(videoP);
+        const uploadingNote = document.createElement('div');
+        uploadingNote.textContent = 'Upload complete. Waiting for conversion to finish...';
+        uploadingNote.style.fontWeight = '600';
+        links.appendChild(uploadingNote);
 
-        const shortP = document.createElement('p');
-        const aShort = document.createElement('a');
-        aShort.href = j.shortUrl;
-        aShort.target = '_blank';
-        aShort.textContent = j.shortUrl;
-        shortP.appendChild(document.createTextNode('Short URL: '));
-        shortP.appendChild(aShort);
-        links.appendChild(shortP);
+        // create a container that pollTranscode expects (id: conv-status-<id>)
+        const convDiv = document.createElement('div');
+        convDiv.id = 'conv-status-' + id;
+        convDiv.style.marginTop = '10px';
 
-        const videoEl = document.createElement('video');
-        videoEl.src = `/v/${j.id}`;
-        videoEl.controls = true;
-        videoEl.width = 480;
-        links.appendChild(videoEl);
+        const convBar = document.createElement('progress');
+        convBar.max = 100;
+        convBar.value = 0;
+        convBar.style.width = '100%';
+        convBar.id = 'conv-bar-' + id;
+  const convPct = document.createElement('div');
+        convPct.id = 'conv-pct-' + id;
+        convPct.textContent = '0%';
+        convPct.style.textAlign = 'right';
+        convPct.style.fontSize = '12px';
+        convPct.style.marginTop = '4px';
 
-        const labelInput = document.getElementById('label');
-        const formats = makeFormats(j.videoUrl, labelInput.value);
+  // ETA and info elements (filled by websocket or poll)
+  const convEta = document.createElement('div');
+  convEta.id = 'conv-eta-' + id;
+  convEta.textContent = '';
+  convEta.style.fontSize = '12px';
+  convEta.style.textAlign = 'right';
+  convEta.style.color = '#333';
 
-        const note = document.createElement('p');
-        note.style.marginTop = '12px';
-        note.innerHTML = '<strong>Copy a format:</strong> click a copy button next to the format you want. Note: Discord chat does not support custom clickable Markdown links ([text](url)) in normal messages — use a webhook/embed or a bot to show a clickable title. Spoiler (||url||) hides the link until clicked.';
-        links.appendChild(note);
+  const convInfo = document.createElement('div');
+  convInfo.id = 'conv-info-' + id;
+  convInfo.textContent = '';
+  convInfo.style.fontSize = '12px';
+  convInfo.style.color = '#666';
 
-        const list = document.createElement('div');
-        list.style.marginTop = '8px';
+        convDiv.appendChild(convBar);
+        convDiv.appendChild(convPct);
+        convDiv.appendChild(convEta);
+        convDiv.appendChild(convInfo);
+        links.appendChild(convDiv);
+      }
 
-        function addRow(label, value){
-          const row = document.createElement('div');
-          row.style.marginBottom = '8px';
-          const lbl = document.createElement('div');
-          lbl.textContent = label;
-          lbl.style.fontWeight = '600';
-          const ta = document.createElement('textarea');
-          ta.readOnly = true;
-          ta.rows = 1;
-          ta.style.width = '100%';
-          ta.textContent = value;
-          const btn = document.createElement('button');
-          btn.textContent = 'Copy';
-          btn.style.marginTop = '4px';
-          btn.addEventListener('click', async ()=>{
-            try{
-              await navigator.clipboard.writeText(value);
-              btn.textContent = 'Copied!';
-              setTimeout(()=>btn.textContent = 'Copy', 1500);
-            }catch(e){
-              // fallback: select the textarea
-              ta.select();
-              document.execCommand('copy');
-              btn.textContent = 'Copied!';
-              setTimeout(()=>btn.textContent = 'Copy', 1500);
-            }
-          });
-          row.appendChild(lbl);
-          row.appendChild(ta);
-          row.appendChild(btn);
-          list.appendChild(row);
-        }
+      async function showFinalResults(id){
+        try{
+          const r = await fetch('/info/' + id);
+          if (!r.ok) { links.textContent = 'Failed to load final info'; return; }
+          const j = await r.json();
+          // render the full results now
+          links.innerHTML = '';
+          const videoP = document.createElement('p');
+          const aVideo = document.createElement('a');
+          aVideo.href = j.videoUrl;
+          aVideo.target = '_blank';
+          aVideo.textContent = j.videoUrl;
+          videoP.appendChild(document.createTextNode('Video URL: '));
+          videoP.appendChild(aVideo);
+          links.appendChild(videoP);
 
-        addRow('Direct URL', formats.direct);
-        addRow('Markdown-style [label](url) (NOT clickable in Discord chat)', formats.markdown);
-        addRow('Spoiler (hides until clicked)', formats.spoiler);
-        addRow('HTML anchor (useful in embeds or other platforms)', formats.html);
-        addRow('Discord webhook/embed JSON (paste into a webhook payload)', formats.webhookJSON);
+          const shortP = document.createElement('p');
+          const aShort = document.createElement('a');
+          aShort.href = j.shortUrl;
+          aShort.target = '_blank';
+          aShort.textContent = j.shortUrl;
+          shortP.appendChild(document.createTextNode('Short URL: '));
+          shortP.appendChild(aShort);
+          links.appendChild(shortP);
 
-        links.appendChild(list);
+          const videoEl = document.createElement('video');
+          videoEl.src = `/v/${j.id}`;
+          videoEl.controls = true;
+          videoEl.width = 480;
+          links.appendChild(videoEl);
 
-  // area for conversion progress
-  const convDiv = document.createElement('div');
-  convDiv.id = 'conv-status-' + j.id;
-  convDiv.style.marginTop = '10px';
-  links.appendChild(convDiv);
+          const labelInput = document.getElementById('label');
+          const formats = makeFormats(j.videoUrl, labelInput.value);
 
-        // webhook UI
-        const whDiv = document.createElement('div');
-        whDiv.style.marginTop = '12px';
-        const whLabel = document.createElement('label');
-        whLabel.textContent = 'Discord Webhook URL (optional): ';
-        const whInput = document.createElement('input');
-        whInput.type = 'text';
-        whInput.style.width = '70%';
-        whInput.placeholder = 'https://discord.com/api/webhooks/....';
-        const postBtn = document.createElement('button');
-        postBtn.textContent = 'Post Embed to Webhook';
-        postBtn.style.marginLeft = '8px';
-        postBtn.addEventListener('click', async ()=>{
-          const url = whInput.value.trim();
-          if (!url) return alert('Paste a webhook URL first');
-          postBtn.disabled = true;
-          postBtn.textContent = 'Posting...';
-          try{
-            const resp = await fetch('/post-webhook', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ webhookUrl: url, id: j.id, label: labelInput.value })
+          const note = document.createElement('p');
+          note.style.marginTop = '12px';
+          note.innerHTML = '<strong>Copy a format:</strong> click a copy button next to the format you want. Note: Discord chat does not support custom clickable Markdown links ([text](url)) in normal messages — use a webhook/embed or a bot to show a clickable title. Spoiler (||url||) hides the link until clicked.';
+          links.appendChild(note);
+
+          const list = document.createElement('div');
+          list.style.marginTop = '8px';
+
+          function addRow(label, value){
+            const row = document.createElement('div');
+            row.style.marginBottom = '8px';
+            const lbl = document.createElement('div');
+            lbl.textContent = label;
+            lbl.style.fontWeight = '600';
+            const ta = document.createElement('textarea');
+            ta.readOnly = true;
+            ta.rows = 1;
+            ta.style.width = '100%';
+            ta.textContent = value;
+            const btn = document.createElement('button');
+            btn.textContent = 'Copy';
+            btn.style.marginTop = '4px';
+            btn.addEventListener('click', async ()=>{
+              try{
+                await navigator.clipboard.writeText(value);
+                btn.textContent = 'Copied!';
+                setTimeout(()=>btn.textContent = 'Copy', 1500);
+              }catch(e){
+                // fallback: select the textarea
+                ta.select();
+                document.execCommand('copy');
+                btn.textContent = 'Copied!';
+                setTimeout(()=>btn.textContent = 'Copy', 1500);
+              }
             });
-            const jj = await resp.json();
-            if (resp.ok) {
-              postBtn.textContent = 'Posted ✓';
-            } else {
-              postBtn.textContent = 'Failed';
-              alert('Webhook error: ' + JSON.stringify(jj));
-            }
-          }catch(e){
-            alert('Error: ' + e);
-            postBtn.textContent = 'Failed';
+            row.appendChild(lbl);
+            row.appendChild(ta);
+            row.appendChild(btn);
+            list.appendChild(row);
           }
-          setTimeout(()=>{ postBtn.disabled = false; postBtn.textContent = 'Post Embed to Webhook'; }, 1500);
-        });
-        whDiv.appendChild(whLabel);
-        whDiv.appendChild(whInput);
-        whDiv.appendChild(postBtn);
-        links.appendChild(whDiv);
 
-        // update formats when user changes label
-        const labelInputEl = document.getElementById('label');
-        labelInputEl.oninput = ()=>{
-          const newFormats = makeFormats(j.videoUrl, labelInputEl.value);
-          // update all textareas in order
-          const tas = list.querySelectorAll('textarea');
-          const vals = [newFormats.direct, newFormats.angle, newFormats.spoiler, newFormats.markdown, newFormats.html, newFormats.webhookJSON];
-          tas.forEach((t,i)=> t.textContent = vals[i]);
-        };
+          addRow('Direct URL', formats.direct);
+          addRow('Markdown-style [label](url) (NOT clickable in Discord chat)', formats.markdown);
+          addRow('Spoiler (hides until clicked)', formats.spoiler);
+          addRow('HTML anchor (useful in embeds or other platforms)', formats.html);
+          addRow('Discord webhook/embed JSON (paste into a webhook payload)', formats.webhookJSON);
+
+          links.appendChild(list);
+
+          // webhook UI
+          const whDiv = document.createElement('div');
+          whDiv.style.marginTop = '12px';
+          const whLabel = document.createElement('label');
+          whLabel.textContent = 'Discord Webhook URL (optional): ';
+          const whInput = document.createElement('input');
+          whInput.type = 'text';
+          whInput.style.width = '70%';
+          whInput.placeholder = 'https://discord.com/api/webhooks/....';
+          const postBtn = document.createElement('button');
+          postBtn.textContent = 'Post Embed to Webhook';
+          postBtn.style.marginLeft = '8px';
+          postBtn.addEventListener('click', async ()=>{
+            const url = whInput.value.trim();
+            if (!url) return alert('Paste a webhook URL first');
+            postBtn.disabled = true;
+            postBtn.textContent = 'Posting...';
+            try{
+              const resp = await fetch('/post-webhook', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ webhookUrl: url, id: j.id, label: labelInput.value })
+              });
+              const jj = await resp.json();
+              if (resp.ok) {
+                postBtn.textContent = 'Posted ✓';
+              } else {
+                postBtn.textContent = 'Failed';
+                alert('Webhook error: ' + JSON.stringify(jj));
+              }
+            }catch(e){
+              alert('Error: ' + e);
+              postBtn.textContent = 'Failed';
+            }
+            setTimeout(()=>{ postBtn.disabled = false; postBtn.textContent = 'Post Embed to Webhook'; }, 1500);
+          });
+          whDiv.appendChild(whLabel);
+          whDiv.appendChild(whInput);
+          whDiv.appendChild(postBtn);
+          links.appendChild(whDiv);
+
+          // update formats when user changes label
+          const labelInputEl = document.getElementById('label');
+          labelInputEl.oninput = ()=>{
+            const newFormats = makeFormats(j.videoUrl, labelInputEl.value);
+            // update all textareas in order
+            const tas = list.querySelectorAll('textarea');
+            const vals = [newFormats.direct, newFormats.angle, newFormats.spoiler, newFormats.markdown, newFormats.html, newFormats.webhookJSON];
+            tas.forEach((t,i)=> t.textContent = vals[i]);
+          };
+        }catch(e){
+          links.textContent = 'Failed to load final info: ' + e;
+        }
       }
 
       let transcodePoller = null;
@@ -257,13 +382,52 @@
             const r = await fetch('/transcode-status/' + id);
             const j = await r.json();
             if (j.status === 'none') { convDiv.textContent = ''; clearInterval(transcodePoller); transcodePoller = null; return; }
+            const bar = document.getElementById('conv-bar-' + id);
+            const pct = document.getElementById('conv-pct-' + id);
             if (j.status === 'queued' || j.status === 'running'){
-              convDiv.innerHTML = `<div style="font-weight:600">Converting: ${j.progress || 0}%</div>`;
+              // set green accent while running and ensure background is white
+              if (bar) {
+                try{ bar.style.accentColor = 'limegreen'; }catch(e){}
+                try{ bar.style.background = 'white'; }catch(e){}
+              }
+              const progress = (typeof j.progress === 'number') ? j.progress : 0;
+              if (bar) bar.value = progress;
+              if (pct) pct.textContent = progress + '%';
+
+              // ETA calculation: prefer server-provided duration & elapsed
+              const etaEl = document.getElementById('conv-eta-' + id);
+              let etaText = '';
+              if (j.duration && j.elapsed){
+                const remaining = Math.max(0, Math.round(j.duration - j.elapsed));
+                etaText = secondsToHMS(remaining) + ' left';
+              } else if (progress > 0 && j.elapsed){
+                // estimate total time from elapsed and progress
+                const totalEst = Math.round(j.elapsed * (100 / progress));
+                const remaining = Math.max(0, totalEst - Math.round(j.elapsed));
+                etaText = secondsToHMS(remaining) + ' left';
+              } else if (progress > 0){
+                etaText = 'Estimating...';
+              } else {
+                etaText = '';
+              }
+              if (etaEl) etaEl.textContent = etaText;
+              // show only totalFrames if available (fps removed)
+              const infoEl = document.getElementById('conv-info-' + id);
+              if (infoEl) {
+                const parts = [];
+                if (typeof j.totalFrames === 'number' && j.totalFrames > 0) parts.push('frames ' + j.totalFrames);
+                infoEl.textContent = parts.join(' • ');
+              }
             } else if (j.status === 'done'){
-              convDiv.innerHTML = `<div style="font-weight:600">Conversion finished</div>`;
+              if (bar) bar.value = 100;
+              if (pct) pct.textContent = '100%';
+              const etaEl = document.getElementById('conv-eta-' + id);
+              if (etaEl) etaEl.textContent = 'Done';
               clearInterval(transcodePoller); transcodePoller = null;
-              // reload the page's info (fetch updated data) — simply refresh the current results by hitting /v/:id as video src is same
+              // show final links now
+              showFinalResults(id);
             } else if (j.status === 'error'){
+              if (pct) pct.textContent = 'Error';
               convDiv.innerHTML = `<div style="color:crimson">Conversion error: ${j.message}</div>`;
               clearInterval(transcodePoller); transcodePoller = null;
             }
