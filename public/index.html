@@ -69,6 +69,9 @@
         convEta.style.textAlign = 'right';
         convEta.style.color = '#333';
 
+        // show upload ETA under the progress bar
+        pcont.appendChild(convEta);
+
         links.appendChild(pcont);
 
         // return handles so caller can wire them up
@@ -86,6 +89,7 @@
         const fd = new FormData();
         fd.append('file', file);
         const ui = createProgressUI();
+        const uploadStart = Date.now();
 
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/upload');
@@ -94,6 +98,18 @@
             const percent = Math.round((ev.loaded / ev.total) * 100);
             ui.bar.value = percent;
             ui.pct.textContent = percent + '%';
+            // estimate remaining time using uploaded bytes and elapsed time
+            try {
+              const elapsedSec = Math.max(0, (Date.now() - uploadStart) / 1000);
+              if (elapsedSec > 0 && ev.loaded > 0) {
+                const rate = ev.loaded / elapsedSec; // bytes per second
+                const remainingBytes = Math.max(0, ev.total - ev.loaded);
+                const etaSec = Math.round(remainingBytes / (rate || 1));
+                ui.convEta.textContent = secondsToHMS(etaSec) + ' left';
+              } else {
+                ui.convEta.textContent = '';
+              }
+            } catch (e) { ui.convEta.textContent = ''; }
           }
         };
         xhr.onreadystatechange = () => {
@@ -102,6 +118,8 @@
               try{
                 const j = JSON.parse(xhr.responseText);
                   // render minimal UI: show upload finished and start polling conversion
+                  // mark upload UI as complete
+                  ui.bar.value = 100; ui.pct.textContent = '100%'; ui.convEta.textContent = 'Upload complete';
                   renderResultsPlaceholder(j.id);
                   // try to use websocket subscription for real-time updates
                   try {
