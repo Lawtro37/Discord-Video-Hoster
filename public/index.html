@@ -9,12 +9,24 @@
       .drop { border:2px dashed #888; padding:40px; text-align:center; border-radius:8px; }
       .links { margin-top:20px; }
       input[type=file]{ display:block; margin:10px auto; }
+      .note {
+        background: rgba(255, 241, 118, 0.6); /* soft translucent yellow */
+        border: 1px solid rgba(204, 170, 0, 0.4);
+        padding: 10px 14px;
+        border-radius: 8px;
+        display: inline-block;
+      }
     </style>
   </head>
   <body>
     <h1>Video Hoster</h1>
     <div class="drop" id="drop">Drop a video here or select one</div>
     <input id="file" type="file" accept="video/*" />
+  <p class="note"><strong>note:</strong> links and files are cleared when the server restarts</p>
+    <div style="margin-top:5px">
+      <label for="label">Custom label (used for Markdown/HTML/embed): </label>
+      <input id="label" type="text" placeholder="Watch this video" style="width:60%; margin-left:8px" />
+    </div>
     <div class="links" id="links"></div>
 
     <script>
@@ -42,12 +54,152 @@
           const res = await fetch('/upload', { method:'POST', body: fd });
           const j = await res.json();
           if (j.error) { links.textContent = 'Error: ' + j.error; return; }
-          links.innerHTML = `<p>Video URL: <a href="${j.videoUrl}" target="_blank">${j.videoUrl}</a></p>
-          <p>Short URL: <a href="${j.shortUrl}" target="_blank">${j.shortUrl}</a></p>
-          <video src="/v/${j.id}" controls width="480"></video>`;
+          renderResults(j);
         }catch(err){
           links.textContent = 'Upload failed: ' + err;
         }
+      }
+
+      function makeFormats(url, label){
+        const safeLabel = (label || '').trim() || 'Watch video';
+        return {
+          direct: url,
+          markdown: `[${safeLabel}](${url})`,
+          spoiler: `||${url}||`,
+          html: `<a href="${url}">${safeLabel}</a>`,
+          webhookJSON: JSON.stringify({embeds:[{title:safeLabel, url: url, description: "Uploaded via Video Hoster"}]}, null, 2)
+        };
+      }
+
+      function renderResults(j){
+        links.innerHTML = '';
+        const videoP = document.createElement('p');
+        const aVideo = document.createElement('a');
+        aVideo.href = j.videoUrl;
+        aVideo.target = '_blank';
+        aVideo.textContent = j.videoUrl;
+        videoP.appendChild(document.createTextNode('Video URL: '));
+        videoP.appendChild(aVideo);
+        links.appendChild(videoP);
+
+        const shortP = document.createElement('p');
+        const aShort = document.createElement('a');
+        aShort.href = j.shortUrl;
+        aShort.target = '_blank';
+        aShort.textContent = j.shortUrl;
+        shortP.appendChild(document.createTextNode('Short URL: '));
+        shortP.appendChild(aShort);
+        links.appendChild(shortP);
+
+        const videoEl = document.createElement('video');
+        videoEl.src = `/v/${j.id}`;
+        videoEl.controls = true;
+        videoEl.width = 480;
+        links.appendChild(videoEl);
+
+        const labelInput = document.getElementById('label');
+        const formats = makeFormats(j.videoUrl, labelInput.value);
+
+        const note = document.createElement('p');
+        note.style.marginTop = '12px';
+        note.innerHTML = '<strong>Copy a format:</strong> click a copy button next to the format you want. Note: Discord chat does not support custom clickable Markdown links ([text](url)) in normal messages — use a webhook/embed or a bot to show a clickable title. Spoiler (||url||) hides the link until clicked.';
+        links.appendChild(note);
+
+        const list = document.createElement('div');
+        list.style.marginTop = '8px';
+
+        function addRow(label, value){
+          const row = document.createElement('div');
+          row.style.marginBottom = '8px';
+          const lbl = document.createElement('div');
+          lbl.textContent = label;
+          lbl.style.fontWeight = '600';
+          const ta = document.createElement('textarea');
+          ta.readOnly = true;
+          ta.rows = 1;
+          ta.style.width = '100%';
+          ta.textContent = value;
+          const btn = document.createElement('button');
+          btn.textContent = 'Copy';
+          btn.style.marginTop = '4px';
+          btn.addEventListener('click', async ()=>{
+            try{
+              await navigator.clipboard.writeText(value);
+              btn.textContent = 'Copied!';
+              setTimeout(()=>btn.textContent = 'Copy', 1500);
+            }catch(e){
+              // fallback: select the textarea
+              ta.select();
+              document.execCommand('copy');
+              btn.textContent = 'Copied!';
+              setTimeout(()=>btn.textContent = 'Copy', 1500);
+            }
+          });
+          row.appendChild(lbl);
+          row.appendChild(ta);
+          row.appendChild(btn);
+          list.appendChild(row);
+        }
+
+        addRow('Direct URL', formats.direct);
+        addRow('Angle-bracket (may suppress unfurling)', formats.angle);
+        addRow('Spoiler (hides until clicked)', formats.spoiler);
+        addRow('Markdown-style [label](url) (NOT clickable in Discord chat)', formats.markdown);
+        addRow('HTML anchor (useful in embeds or other platforms)', formats.html);
+        addRow('Discord webhook/embed JSON (paste into a webhook payload)', formats.webhookJSON);
+
+        links.appendChild(list);
+
+        // webhook UI
+        const whDiv = document.createElement('div');
+        whDiv.style.marginTop = '12px';
+        const whLabel = document.createElement('label');
+        whLabel.textContent = 'Discord Webhook URL (optional): ';
+        const whInput = document.createElement('input');
+        whInput.type = 'text';
+        whInput.style.width = '70%';
+        whInput.placeholder = 'https://discord.com/api/webhooks/....';
+        const postBtn = document.createElement('button');
+        postBtn.textContent = 'Post Embed to Webhook';
+        postBtn.style.marginLeft = '8px';
+        postBtn.addEventListener('click', async ()=>{
+          const url = whInput.value.trim();
+          if (!url) return alert('Paste a webhook URL first');
+          postBtn.disabled = true;
+          postBtn.textContent = 'Posting...';
+          try{
+            const resp = await fetch('/post-webhook', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ webhookUrl: url, id: j.id, label: labelInput.value })
+            });
+            const jj = await resp.json();
+            if (resp.ok) {
+              postBtn.textContent = 'Posted ✓';
+            } else {
+              postBtn.textContent = 'Failed';
+              alert('Webhook error: ' + JSON.stringify(jj));
+            }
+          }catch(e){
+            alert('Error: ' + e);
+            postBtn.textContent = 'Failed';
+          }
+          setTimeout(()=>{ postBtn.disabled = false; postBtn.textContent = 'Post Embed to Webhook'; }, 1500);
+        });
+        whDiv.appendChild(whLabel);
+        whDiv.appendChild(whInput);
+        whDiv.appendChild(postBtn);
+        links.appendChild(whDiv);
+
+        // update formats when user changes label
+        const labelInputEl = document.getElementById('label');
+        labelInputEl.oninput = ()=>{
+          const newFormats = makeFormats(j.videoUrl, labelInputEl.value);
+          // update all textareas in order
+          const tas = list.querySelectorAll('textarea');
+          const vals = [newFormats.direct, newFormats.angle, newFormats.spoiler, newFormats.markdown, newFormats.html, newFormats.webhookJSON];
+          tas.forEach((t,i)=> t.textContent = vals[i]);
+        };
       }
     </script>
   </body>
