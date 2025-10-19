@@ -111,3 +111,58 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
 	console.log(`Server listening on http://localhost:${PORT}`);
 });
+
+// Post an embed-only payload to a Discord webhook URL so the message shows an embed without the raw link
+app.post('/post-webhook', express.json(), async (req, res) => {
+	const { webhookUrl, id, label } = req.body || {};
+	if (!webhookUrl || !id) return res.status(400).json({ error: 'webhookUrl and id required' });
+
+	const d = readData();
+	if (!d[id]) return res.status(404).json({ error: 'id not found' });
+
+	const videoUrl = `${req.protocol}://${req.get('host')}/v/${id}`;
+	const title = (label && String(label).trim()) || d[id].originalName || 'Video';
+
+	const payload = { embeds: [{ title, url: videoUrl, description: 'Uploaded via Video Hoster' }] };
+
+	// Try to use global fetch if available (Node 18+). Otherwise fall back to https.request.
+	try {
+		if (typeof fetch === 'function') {
+			const r = await fetch(webhookUrl, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(payload),
+			});
+			if (!r.ok) return res.status(502).json({ error: 'Webhook request failed', status: r.status });
+			return res.json({ ok: true });
+		} else {
+			// fallback
+			const { URL } = require('url');
+			const https = require('https');
+			const u = new URL(webhookUrl);
+			const opts = {
+				hostname: u.hostname,
+				path: u.pathname + (u.search || ''),
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					'Content-Length': Buffer.byteLength(JSON.stringify(payload)),
+				},
+			};
+
+			const req2 = https.request(opts, (r2) => {
+				let data = '';
+				r2.on('data', (c) => data += c.toString());
+				r2.on('end', () => {
+					if (r2.statusCode >= 200 && r2.statusCode < 300) return res.json({ ok: true });
+					return res.status(502).json({ error: 'Webhook request failed', status: r2.statusCode, body: data });
+				});
+			});
+			req2.on('error', (err) => res.status(500).json({ error: err.message }));
+			req2.write(JSON.stringify(payload));
+			req2.end();
+		}
+	} catch (err) {
+		return res.status(500).json({ error: err.message });
+	}
+});
