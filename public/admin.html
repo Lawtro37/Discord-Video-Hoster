@@ -1,0 +1,161 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Admin - Video Hoster</title>
+    <style>
+      body{font-family:system-ui,Arial;max-width:900px;margin:24px auto;padding:20px}
+      table{width:100%;border-collapse:collapse}
+      th,td{border:1px solid #ddd;padding:8px;text-align:left}
+      th{background:#f3f3f3}
+      button{padding:6px 10px}
+      #token{width:60%}
+    </style>
+  </head>
+  <body>
+    <h1>Admin - Video Hoster</h1>
+    <p>Enter admin token to manage uploaded videos.</p>
+    <div>
+      <input id="token" placeholder="Bearer token" />
+      <button id="btnLogin">Use token</button>
+      <button id="btnRefresh">Refresh list</button>
+    </div>
+    <div id="status" style="margin-top:12px;color:#666"></div>
+    <div id="list" style="margin-top:12px"></div>
+
+    <script>
+      const tokenInput = document.getElementById('token');
+      const btnLogin = document.getElementById('btnLogin');
+      const btnRefresh = document.getElementById('btnRefresh');
+      const status = document.getElementById('status');
+      const listDiv = document.getElementById('list');
+
+      // read token from localStorage if present
+      let token = localStorage.getItem('admin_token') || '';
+      if (token) {
+        tokenInput.value = token;
+      }
+      btnLogin.addEventListener('click', ()=>{ token = tokenInput.value.trim(); if (token) localStorage.setItem('admin_token', token); else localStorage.removeItem('admin_token'); status.textContent = token ? 'Token set' : 'Token cleared'; if (token) fetchList(); });
+      btnRefresh.addEventListener('click', ()=>fetchList());
+
+      // Auto-fetch the list if a token is already stored
+      if (token) {
+        status.textContent = 'Using stored token';
+        // small timeout so UI shows token input update before fetching
+        setTimeout(()=>fetchList(), 120);
+      }
+
+      async function fetchList(){
+        if (!token) return status.textContent = 'Set token first';
+        try{
+          status.textContent = 'Loading...';
+          const r = await fetch('/admin/list', { headers: { 'Authorization': 'Bearer '+token } });
+          const j = await r.json();
+          if (!r.ok) { status.textContent = 'Error: '+JSON.stringify(j); return; }
+          renderList(j.items || []);
+          status.textContent = 'Loaded '+(j.items||[]).length+' items';
+        }catch(e){ status.textContent = 'Fetch failed: '+e }
+      }
+
+      function renderList(items){
+        if (!items || items.length === 0) { listDiv.innerHTML = '<div>No videos</div>'; return; }
+        const t = document.createElement('table');
+        const thead = document.createElement('thead');
+        thead.innerHTML = '<tr><th>ID</th><th>Original Name</th><th>Filename</th><th>Size</th><th>Created</th><th>Short</th><th>Actions</th></tr>';
+        t.appendChild(thead);
+        const tb = document.createElement('tbody');
+        items.forEach(it=>{
+          const tr = document.createElement('tr');
+          const btnDel = document.createElement('button'); btnDel.textContent = 'Delete';
+          const btnReview = document.createElement('button'); btnReview.textContent = 'Review'; btnReview.style.marginRight = '6px';
+          btnReview.addEventListener('click', ()=> openReview(it));
+
+          // If item is marked removed, gray the row and disable buttons
+          if (it.removed) {
+            tr.style.opacity = '0.5';
+            tr.style.background = '#fafafa';
+            btnDel.disabled = true;
+            btnReview.disabled = true;
+          }
+          btnDel.addEventListener('click', async ()=>{
+            if (!confirm('Delete '+it.id+'?')) return;
+            try{
+              const r = await fetch('/admin/delete', { method:'POST', headers: {'Content-Type':'application/json','Authorization':'Bearer '+token }, body: JSON.stringify({ id: it.id }) });
+              const jj = await r.json();
+              if (!r.ok) { alert('Delete failed: '+JSON.stringify(jj)); return; }
+              alert('Deleted'); fetchList();
+            }catch(e){ alert('Delete failed: '+e) }
+          });
+
+          tr.innerHTML = `<td>${it.id}</td><td>${escapeHtml(it.originalName||'')}</td><td>${escapeHtml(it.filename||'')}</td><td>${formatBytes(it.size||0)}</td><td>${new Date(it.createdAt||0).toLocaleString()}</td><td>${it.short||''}${it.removed?'<span style="margin-left:8px;padding:2px 6px;background:#eee;border-radius:4px;font-size:12px;color:#666">Removed</span>':''}</td><td></td>`;
+          tr.querySelector('td:last-child').appendChild(btnReview);
+          tr.querySelector('td:last-child').appendChild(btnDel);
+          tb.appendChild(tr);
+        });
+        t.appendChild(tb);
+        listDiv.innerHTML = '';
+        listDiv.appendChild(t);
+      }
+
+      // --- Review modal ---
+      const modalHtml = `
+        <div id="__reviewModal" style="position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:9999">
+          <div style="background:#fff;max-width:880px;width:95%;padding:12px;border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.4)">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <h3 id="__reviewTitle" style="margin:0;font-size:16px">Review</h3>
+              <div>
+                <button id="__closeReview">Close</button>
+              </div>
+            </div>
+            <div id="__reviewBody" style="text-align:center">
+            </div>
+            <div style="margin-top:8px;text-align:right">
+              <button id="__deleteFromModal" style="background:#c0392b;color:#fff;border:none;padding:8px 12px;border-radius:4px">Delete</button>
+            </div>
+          </div>
+        </div>`;
+      document.body.insertAdjacentHTML('beforeend', modalHtml);
+      const reviewModal = document.getElementById('__reviewModal');
+      const reviewBody = document.getElementById('__reviewBody');
+      const reviewTitle = document.getElementById('__reviewTitle');
+      const closeReview = document.getElementById('__closeReview');
+      const deleteFromModal = document.getElementById('__deleteFromModal');
+      let currentReviewItem = null;
+      closeReview.addEventListener('click', ()=> { reviewModal.style.display = 'none'; currentReviewItem = null; });
+      reviewModal.addEventListener('click', (e)=>{ if (e.target === reviewModal) { reviewModal.style.display = 'none'; currentReviewItem = null; } });
+
+      async function openReview(it) {
+        currentReviewItem = it;
+        reviewTitle.textContent = `Review: ${it.id}`;
+        reviewBody.innerHTML = '<div style="padding:24px;color:#666">Loading preview...</div>';
+        reviewModal.style.display = 'flex';
+        try{
+          const r = await fetch(`/info/${it.id}`);
+          const j = await r.json();
+          let html = '';
+          if (j.removed) {
+            html = `<img src="${j.removedImageUrl}" style="max-width:100%;height:auto;border:1px solid #ddd" alt="Removed" />`;
+          } else {
+            html = `<video controls style="max-width:100%;height:auto;" src="/v/${it.id}"></video>`;
+          }
+          reviewBody.innerHTML = html;
+        }catch(e){ reviewBody.innerHTML = '<div style="padding:24px;color:#900">Preview failed: '+e+'</div>'; }
+      }
+
+      deleteFromModal.addEventListener('click', async ()=>{
+        if (!currentReviewItem) return;
+        if (!confirm('Delete '+currentReviewItem.id+'?')) return;
+        try{
+          const r = await fetch('/admin/delete', { method:'POST', headers: {'Content-Type':'application/json','Authorization':'Bearer '+token }, body: JSON.stringify({ id: currentReviewItem.id }) });
+          const jj = await r.json();
+          if (!r.ok) { alert('Delete failed: '+JSON.stringify(jj)); return; }
+          alert('Deleted'); reviewModal.style.display = 'none'; fetchList();
+        }catch(e){ alert('Delete failed: '+e) }
+      });
+
+      function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"})[c]) }
+      function formatBytes(n){ if (n<1024) return n+' B'; if (n<1024*1024) return Math.round(n/1024)+' KB'; return Math.round(n/(1024*1024))+' MB'; }
+    </script>
+  </body>
+</html>
