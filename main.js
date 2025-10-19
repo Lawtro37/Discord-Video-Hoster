@@ -141,7 +141,12 @@ function generateShortId(len = 7) {
 app.use((req, res, next) => {
 	try {
 		const host = (req.get('host') || '').toLowerCase();
-		if (host && host.indexOf(SHORT_DOMAIN.toLowerCase()) !== -1) {
+		if (host && SHORT_DOMAIN && host.indexOf(SHORT_DOMAIN.toLowerCase()) !== -1) {
+			// If visitor opened the bare domain (e.g. https://lawton.au/), redirect to external landing.
+			if (req.path === '/' || req.path === '') {
+				const ROOT_REDIRECT = process.env.LAWTON_ROOT_REDIRECT || 'https://discord-host.lawtrostudios.com';
+				return res.redirect(302, ROOT_REDIRECT);
+			}
 			const m = req.path.match(/^\/([A-Za-z0-9_-]{4,})$/);
 			if (m) {
 				const short = m[1];
@@ -149,6 +154,8 @@ app.use((req, res, next) => {
 				if (d && d._short && d._short[short]) {
 					const id = d._short[short];
 					return res.redirect(302, `/s/${id}`);
+				} else {
+					return sendInvalidEmbed(req, res);
 				}
 			}
 		}
