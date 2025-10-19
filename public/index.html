@@ -120,7 +120,12 @@
                   // render minimal UI: show upload finished and start polling conversion
                   // mark upload UI as complete
                   ui.bar.value = 100; ui.pct.textContent = '100%'; ui.convEta.textContent = 'Upload complete';
-                  renderResultsPlaceholder(j.id);
+                  // If server indicates no transcode is queued, show final results immediately
+                  if (!j.transcodeQueued) {
+                    showFinalResults(j.id);
+                  } else {
+                    renderResultsPlaceholder(j.id);
+                  }
                   // try to use websocket subscription for real-time updates
                   try {
                     const wsProto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
@@ -267,14 +272,17 @@
           videoP.appendChild(aVideo);
           links.appendChild(videoP);
 
-          const shortP = document.createElement('p');
-          const aShort = document.createElement('a');
-          aShort.href = j.shortUrl;
-          aShort.target = '_blank';
-          aShort.textContent = j.shortUrl;
-          shortP.appendChild(document.createTextNode('Short URL: '));
-          shortP.appendChild(aShort);
-          links.appendChild(shortP);
+          // show lawton.au short URL if provided by server
+          if (j.lawtonShortUrl) {
+            const lawP = document.createElement('p');
+            const aLaw = document.createElement('a');
+            aLaw.href = j.lawtonShortUrl;
+            aLaw.target = '_blank';
+            aLaw.textContent = j.lawtonShortUrl;
+            lawP.appendChild(document.createTextNode('Short URL: '));
+            lawP.appendChild(aLaw);
+            links.appendChild(lawP);
+          }
 
           const videoEl = document.createElement('video');
           videoEl.src = `/v/${j.id}`;
