@@ -36,7 +36,7 @@
         // redirect to main site
         location.href = 'https://discord-host.lawtrostudios.com' + location.pathname + location.search + location.hash;
       }
-      
+
       const drop = document.getElementById('drop');
       const fileInput = document.getElementById('file');
       const links = document.getElementById('links');
@@ -298,6 +298,10 @@
           links.appendChild(videoEl);
 
           const labelInput = document.getElementById('label');
+          // default the label to the original file name (fall back to filename or 'Watch video')
+          try {
+            labelInput.value = (j.info && (j.info.originalName || j.info.filename)) || '';
+          } catch (e) { labelInput.value = ''; }
           const formats = makeFormats(j.videoUrl, labelInput.value);
 
           const note = document.createElement('p');
@@ -394,10 +398,10 @@
           const labelInputEl = document.getElementById('label');
           labelInputEl.oninput = ()=>{
             const newFormats = makeFormats(j.videoUrl, labelInputEl.value);
-            // update all textareas in order
+            // update all textareas in order to match the rows added above
             const tas = list.querySelectorAll('textarea');
-            const vals = [newFormats.direct, newFormats.angle, newFormats.spoiler, newFormats.markdown, newFormats.html, newFormats.webhookJSON];
-            tas.forEach((t,i)=> t.textContent = vals[i]);
+            const vals = [newFormats.direct, newFormats.markdown, newFormats.spoiler, newFormats.html, newFormats.webhookJSON];
+            tas.forEach((t,i)=> { if (vals[i] !== undefined) t.textContent = vals[i]; });
           };
         }catch(e){
           links.textContent = 'Failed to load final info: ' + e;
