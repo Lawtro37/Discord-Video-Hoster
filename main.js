@@ -14,6 +14,27 @@ if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({}), '
 const app = express();
 const upload = multer({ dest: UPLOADS_DIR });
 
+const ffmpeg = require('fluent-ffmpeg');
+let ffmpegPath;
+try {
+	ffmpegPath = require('ffmpeg-static');
+	if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
+} catch (e) {
+	// ffmpeg-static not installed or failed; fluent-ffmpeg will try to use system ffmpeg
+	ffmpegPath = null;
+}
+
+function transcodeToMp4(inputPath, outputPath) {
+	return new Promise((resolve, reject) => {
+		const proc = ffmpeg(inputPath)
+			.outputOptions(['-y', '-c:v libx264', '-preset veryfast', '-crf 23', '-c:a aac', '-b:a 128k'])
+			.on('start', (cmd) => { /*console.log('ffmpeg start', cmd)*/; })
+			.on('error', (err, stdout, stderr) => reject(new Error(err.message || String(err))))
+			.on('end', () => resolve({ outputPath }))
+			.save(outputPath);
+	});
+}
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -29,33 +50,74 @@ function writeData(d) {
 	fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2), 'utf8');
 }
 
-app.post('/upload', upload.single('file'), (req, res) => {
+app.post('/upload', upload.single('file'), async (req, res) => {
 	if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-	const id = uuidv4();
-	const ext = path.extname(req.file.originalname) || '';
-	const newName = id + ext;
-	const newPath = path.join(UPLOADS_DIR, newName);
+		const id = uuidv4();
+		const ext = path.extname(req.file.originalname) || '';
+		const origName = req.file.originalname;
+		const tempName = req.file.filename; // multer's temp name in uploads
+		const tempPath = path.join(UPLOADS_DIR, tempName);
 
-	fs.renameSync(req.file.path, newPath);
+		// target filename initially same extension as original
+		let finalExt = ext.toLowerCase();
+		let finalName = id + finalExt;
+		let finalPath = path.join(UPLOADS_DIR, finalName);
 
-	const d = readData();
-	d[id] = {
-		id,
-		filename: newName,
-		originalName: req.file.originalname,
-		mime: req.file.mimetype || mime.lookup(newName) || 'application/octet-stream',
-		size: req.file.size,
-		createdAt: Date.now(),
-	};
-	writeData(d);
+		// move multer file to the intended filename (we'll overwrite if needed)
+		try {
+			fs.renameSync(tempPath, finalPath);
+		} catch (err) {
+			// fallback: if rename fails, try copying
+			fs.copyFileSync(tempPath, finalPath);
+			try { fs.unlinkSync(tempPath); } catch (e) {}
+		}
 
-	const host = req.get('host');
-	const protocol = req.protocol;
-	const videoUrl = `${protocol}://${host}/v/${id}`;
-	const shortUrl = `${protocol}://${host}/s/${id}`;
+		let converted = false;
+		let warning = null;
 
-	res.json({ id, videoUrl, shortUrl, info: d[id] });
+		// If not a supported container, try converting to mp4
+		const supportedExts = new Set(['.mp4', '.mov', '.webm']);
+		if (!supportedExts.has(finalExt)) {
+			const convertedName = id + '.mp4';
+			const convertedPath = path.join(UPLOADS_DIR, convertedName);
+			try {
+				await transcodeToMp4(finalPath, convertedPath);
+				// replace final file with converted one
+				try { fs.unlinkSync(finalPath); } catch (e) {}
+				finalName = convertedName;
+				finalPath = convertedPath;
+				finalExt = '.mp4';
+				converted = true;
+			} catch (err) {
+				// conversion failed; keep original but include a warning
+				warning = 'Conversion failed or ffmpeg not available; original file kept';
+				console.error('Transcode error:', err && err.message ? err.message : err);
+			}
+		}
+
+		const stat = fs.statSync(finalPath);
+
+		const d = readData();
+		d[id] = {
+			id,
+			filename: finalName,
+			originalName: origName,
+			mime: mime.lookup(finalPath) || req.file.mimetype || 'application/octet-stream',
+			size: stat.size,
+			createdAt: Date.now(),
+			converted: converted,
+		};
+		writeData(d);
+
+		const host = req.get('host');
+		const protocol = req.protocol;
+		const videoUrl = `${protocol}://${host}/v/${id}`;
+		const shortUrl = `${protocol}://${host}/s/${id}`;
+
+		const resp = { id, videoUrl, shortUrl, info: d[id] };
+		if (warning) resp.warning = warning;
+		res.json(resp);
 });
 
 // Short redirect link
