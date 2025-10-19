@@ -30,6 +30,13 @@
     <div class="links" id="links"></div>
 
     <script>
+      // check domain
+      const SHORT_DOMAIN = 'lawton.au';
+      if (location.hostname == SHORT_DOMAIN) {
+        // redirect to main site
+        location.href = 'https://discord-host.lawtrostudios.com' + location.pathname + location.search + location.hash;
+      }
+      
       const drop = document.getElementById('drop');
       const fileInput = document.getElementById('file');
       const links = document.getElementById('links');
