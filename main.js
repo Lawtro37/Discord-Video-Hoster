@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const mime = require('mime-types');
+const crypto = require('crypto');
 
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const DATA_FILE = path.join(__dirname, 'data.json');
@@ -124,6 +125,39 @@ const transcodeJobs = {}; // id -> { status, progress, message }
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Helper to create short ids (base62)
+function generateShortId(len = 7) {
+	const alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+	const bytes = crypto.randomBytes(len);
+	let out = '';
+	for (let i = 0; i < bytes.length; i++) {
+		out += alphabet[bytes[i] % alphabet.length];
+	}
+	return out;
+}
+
+// If a request arrives at the server with the Host header matching SHORT_DOMAIN and
+// the path is a short id (e.g. GET /abc123), redirect to the internal short handler /s/:id
+app.use((req, res, next) => {
+	try {
+		const host = (req.get('host') || '').toLowerCase();
+		if (host && host.indexOf(SHORT_DOMAIN.toLowerCase()) !== -1) {
+			const m = req.path.match(/^\/([A-Za-z0-9_-]{4,})$/);
+			if (m) {
+				const short = m[1];
+				const d = readData();
+				if (d && d._short && d._short[short]) {
+					const id = d._short[short];
+					return res.redirect(302, `/s/${id}`);
+				}
+			}
+		}
+	} catch (e) {
+		// ignore errors and continue
+	}
+	next();
+});
+
 function readData() {
 	try {
 		return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8') || '{}');
@@ -160,6 +194,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 		}
 
 		let converted = false;
+		let transcodeQueued = false;
 		let warning = null;
 
 		// If not a supported container, try converting to mp4
@@ -174,6 +209,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
 						// run conversion in background (simple flow using transcodeToMp4)
 						transcodeJobs[id] = transcodeJobs[id] || { status: 'queued', progress: 0, message: 'queued' };
+						transcodeQueued = true;
 						(async () => {
 							transcodeJobs[id].status = 'running';
 							transcodeJobs[id].message = 'starting';
@@ -230,7 +266,24 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 		const videoUrl = `${protocol}://${host}/v/${id}`;
 		const shortUrl = `${protocol}://${host}/s/${id}`;
 
-		const resp = { id, videoUrl, shortUrl, info: d[id] };
+	// generate a compact short id for lawton-style short links
+	let shortId = null;
+	try {
+		const store = readData();
+		store._short = store._short || {};
+		// create a short id and ensure it's unique (few attempts)
+		for (let attempts = 0; attempts < 6; attempts++) {
+			const cand = generateShortId(5 + Math.floor(Math.random() * 3));
+			if (!store._short[cand]) { shortId = cand; break; }
+		}
+		if (shortId) {
+			store._short[shortId] = id;
+			writeData(store);
+		}
+	} catch (e) { /* ignore */ }
+
+	const resp = { id, videoUrl, shortUrl, info: d[id], transcodeQueued };
+	try { if (shortId) resp.lawtonShortUrl = `https://${SHORT_DOMAIN}/${shortId}`; else resp.lawtonShortUrl = `https://${SHORT_DOMAIN}/${id}`; } catch (e) {}
 		if (warning) resp.warning = warning;
 		res.json(resp);
 });
@@ -287,6 +340,9 @@ app.get('/v/:id', (req, res) => {
 // create http server so we can attach WebSocket server
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
+
+// Short URL domain configuration. If LAWTON_SHORT_DOMAIN is set, use it; otherwise default to lawton.au
+const SHORT_DOMAIN = process.env.LAWTON_SHORT_DOMAIN || 'lawton.au';
 
 // WebSocket server for realtime transcode updates
 const wss = new WebSocket.Server({ server });
@@ -410,7 +466,20 @@ app.get('/info/:id', (req, res) => {
 	const host = req.get('host');
 	const videoUrl = `${protocol}://${host}/v/${id}`;
 	const shortUrl = `${protocol}://${host}/s/${id}`;
-	return res.json({ id, videoUrl, shortUrl, info: d[id] });
+	try {
+		const store = d || readData();
+		let shortCandidate = null;
+		if (store._short) {
+			// find key by value (short -> id mapping)
+			for (const [k, v] of Object.entries(store._short)) {
+				if (v === id) { shortCandidate = k; break; }
+			}
+		}
+		const lawtonShort = `https://${SHORT_DOMAIN}/${shortCandidate || id}`;
+		return res.json({ id, videoUrl, shortUrl, lawtonShortUrl: lawtonShort, info: d[id] });
+	} catch (e) {
+		return res.json({ id, videoUrl, shortUrl, info: d[id] });
+	}
 });
 
 // Serve a simple placeholder PNG (1x1 transparent or small image). We'll serve a tiny embedded PNG.
