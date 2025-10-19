@@ -38,16 +38,85 @@ try {
 	// not fatal; we'll attempt to continue and fall back to any percent provided by ffmpeg
 }
 
-function transcodeToMp4(inputPath, outputPath) {
+function transcodeToMp4(inputPath, outputPath, jobId) {
 	return new Promise((resolve, reject) => {
+		// input size for progress estimation
+		let inputSize = 0;
+		try { inputSize = fs.statSync(inputPath).size || 0; } catch (e) { inputSize = 0; }
+
+		const startTime = Date.now();
+		let pollInterval = null;
+
 		const proc = ffmpeg(inputPath)
-			.outputOptions(['-y', '-c:v libx264', '-preset veryfast', '-crf 23', '-c:a aac', '-b:a 128k'])
-			.on('start', (cmd) => { /*console.log('ffmpeg start', cmd)*/; })
-			.on('error', (err, stdout, stderr) => reject(new Error(err.message || String(err))))
-			.on('end', () => resolve({ outputPath }))
+			.outputOptions([
+				'-y',                 // overwrite
+				'-c copy',            // copy all streams (no re-encode)
+				'-movflags faststart' // better for web playback
+			])
+			.on('start', (cmd) => {
+				console.log('Remuxing (copy):', cmd);
+				// initialize job entry if present
+				try {
+					if (jobId && transcodeJobs[jobId]) {
+						transcodeJobs[jobId].progress = 0;
+						transcodeJobs[jobId].message = 'remuxing (copying)';
+						transcodeJobs[jobId].startedAt = Date.now();
+						try { broadcastStatus(jobId); } catch (e) {}
+					}
+				} catch (e) {}
+
+				// start polling output file size to estimate progress
+				pollInterval = setInterval(() => {
+					try {
+						if (!inputSize) return;
+						let outSize = 0;
+						try { outSize = fs.statSync(outputPath).size || 0; } catch (e) { outSize = 0; }
+						const pct = Math.min(100, Math.round((outSize / inputSize) * 100));
+						if (jobId && transcodeJobs[jobId]) {
+							transcodeJobs[jobId].progress = pct;
+							const elapsed = Math.max(0, Math.round((Date.now() - startTime) / 1000));
+							transcodeJobs[jobId].elapsed = elapsed;
+							if (pct > 0) {
+								const totalEst = Math.round(elapsed * (100 / pct));
+								transcodeJobs[jobId].eta = Math.max(0, totalEst - elapsed);
+							} else {
+								transcodeJobs[jobId].eta = null;
+							}
+							try { broadcastStatus(jobId); } catch (e) {}
+						}
+					} catch (e) {}
+				}, 800);
+			})
+			.on('progress', (p) => {
+				// also update timemark if available
+				try {
+					if (jobId && transcodeJobs[jobId] && p && p.timemark) {
+						transcodeJobs[jobId].timemark = p.timemark;
+						try { broadcastStatus(jobId); } catch (e) {}
+					}
+				} catch (e) {}
+			})
+			.on('error', (err) => {
+				if (pollInterval) clearInterval(pollInterval);
+				return reject(new Error(err.message || String(err)));
+			})
+			.on('end', () => {
+				if (pollInterval) clearInterval(pollInterval);
+				// On end, ensure progress is 100%
+				try {
+					if (jobId && transcodeJobs[jobId]) {
+						transcodeJobs[jobId].progress = 100;
+						transcodeJobs[jobId].elapsed = Math.max(0, Math.round((Date.now() - startTime) / 1000));
+						transcodeJobs[jobId].eta = 0;
+						try { broadcastStatus(jobId); } catch (e) {}
+					}
+				} catch (e) {}
+				return resolve({ outputPath });
+			})
 			.save(outputPath);
 	});
 }
+
 
 // in-memory transcode job tracking
 const transcodeJobs = {}; // id -> { status, progress, message }
@@ -101,137 +170,45 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 				const convertedName = id + '.mp4';
 				const convertedPath = path.join(UPLOADS_DIR, convertedName);
 				converted = false;
-				transcodeJobs[id] = { status: 'queued', progress: 0, message: 'queued' };
+				// transcodeJobs[id] = { status: 'queued', progress: 0, message: 'queued' };
 
-				// run conversion in background
-				(async () => {
-					transcodeJobs[id].status = 'running';
-					transcodeJobs[id].message = 'starting';
-					try { broadcastStatus(id); } catch (e) {}
-					try {
-						// Use ffprobe to get duration, then compute percent from timemark in progress events
-						const parseTimemark = (tm) => {
-							// timemark like "00:01:23.45" -> seconds
-							if (!tm) return 0;
-							const parts = tm.split(':').map(Number);
-							if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
-							if (parts.length === 2) return parts[0]*60 + parts[1];
-							return Number(tm) || 0;
-						};
-
-						await new Promise((resolve, reject) => {
-							// Probe for duration but handle probe errors gracefully
-							ffmpeg.ffprobe(finalPath, (err, meta) => {
-								let duration = 0;
-								let totalFrames = 0;
-								let avgFps = 0;
-								// get duration and frame info from ffprobe metadata
-								if (err) {
-									console.warn('ffprobe failed for', finalPath, err && err.message ? err.message : err);
-								} else if (meta && meta.format && meta.format.duration) {
-									duration = meta.format.duration;
-									// try to read stream-level info
-									if (meta.streams && meta.streams.length) {
-										const s0 = meta.streams[0];
-										if (s0.nb_frames) totalFrames = Number(s0.nb_frames) || 0;
-										if (s0.avg_frame_rate && typeof s0.avg_frame_rate === 'string') {
-											const parts = s0.avg_frame_rate.split('/').map(Number);
-											if (parts.length === 2 && parts[1]) avgFps = parts[0] / parts[1];
-										}
-									}
-								} else if (meta && meta.streams && meta.streams.length) {
-									// try to derive duration from the first stream if available
-									for (const s of meta.streams) {
-										if (s.duration) { duration = Number(s.duration); break; }
-										if (s.tags && s.tags.DURATION) { duration = Number(s.tags.DURATION); break; }
-									}
-									const s0 = meta.streams[0];
-									if (s0) {
-										if (s0.nb_frames) totalFrames = Number(s0.nb_frames) || 0;
-										if (s0.avg_frame_rate && typeof s0.avg_frame_rate === 'string') {
-											const parts = s0.avg_frame_rate.split('/').map(Number);
-											if (parts.length === 2 && parts[1]) avgFps = parts[0] / parts[1];
-										}
-									}
-								}
-								transcodeJobs[id].duration = duration || 0;
-								transcodeJobs[id].totalFrames = totalFrames || 0;
-								transcodeJobs[id].avgFps = avgFps || 0;
-								console.debug('[ffprobe]', id, 'duration=', transcodeJobs[id].duration, 'totalFrames=', transcodeJobs[id].totalFrames, 'avgFps=', transcodeJobs[id].avgFps);
+						// run conversion in background (simple flow using transcodeToMp4)
+						transcodeJobs[id] = transcodeJobs[id] || { status: 'queued', progress: 0, message: 'queued' };
+						(async () => {
+							transcodeJobs[id].status = 'running';
+							transcodeJobs[id].message = 'starting';
+							try { broadcastStatus(id); } catch (e) {}
+							try {
+								transcodeJobs[id].message = 'remux/re-encode (simple)';
 								try { broadcastStatus(id); } catch (e) {}
+								await transcodeToMp4(finalPath, convertedPath, id);
+								// replace final file with converted one
+								try { fs.unlinkSync(finalPath); } catch (e) {}
+								finalName = convertedName;
+								finalPath = convertedPath;
+								finalExt = '.mp4';
+								converted = true;
 
-								const proc = ffmpeg(finalPath)
-									.outputOptions(['-y', '-c:v libx264', '-preset veryfast', '-crf 23', '-c:a aac', '-b:a 128k'])
-									.on('start', (cmd) => { transcodeJobs[id].message = 'started'; console.debug('[transcode]', id, 'start'); })
-									.on('progress', (p) => {
-										// log progress for debugging
-										console.debug('[transcode-progress]', id, JSON.stringify(p));
-										let percent = 0;
-										// prefer timemark/duration when available
-										if (p && p.timemark && transcodeJobs[id].duration) {
-											const secs = parseTimemark(p.timemark);
-											if (transcodeJobs[id].duration > 0) percent = Math.round((secs / transcodeJobs[id].duration) * 100);
-										}
-										// fluent-ffmpeg sometimes provides p.percent; use it as fallback
-										if ((!percent || percent === 0) && typeof p.percent === 'number') {
-											percent = Math.round(p.percent);
-										}
-										// final fallback: use frames/targetSize heuristics if present
-										if ((!percent || percent === 0) && p && p.frames && p.targetSize) {
-											// naive heuristic - not accurate but better than 0
-											percent = Math.min(99, Math.round((p.frames % 1000) / 1000 * 100));
-										}
-										// clamp
-										percent = Math.min(100, Math.max(0, percent || 0));
-										transcodeJobs[id].progress = percent;
-										transcodeJobs[id].message = 'running';
-										// compute server-side ETA using currentFps + totalFrames when possible
-										try {
-											let eta = null; // seconds remaining
-											if (p && typeof p.currentFps === 'number' && typeof p.frames === 'number' && transcodeJobs[id].totalFrames && transcodeJobs[id].totalFrames > 0) {
-												const remainingFrames = Math.max(0, transcodeJobs[id].totalFrames - p.frames);
-												const fps = p.currentFps || transcodeJobs[id].avgFps || 1;
-												eta = Math.round(remainingFrames / (fps || 1));
-											} else if (transcodeJobs[id].duration && transcodeJobs[id].elapsed) {
-												eta = Math.max(0, Math.round(transcodeJobs[id].duration - transcodeJobs[id].elapsed));
-											} else if (p && typeof p.currentFps === 'number' && typeof p.frames === 'number' && transcodeJobs[id].avgFps && transcodeJobs[id].avgFps > 0 && transcodeJobs[id].duration) {
-												const estTotal = Math.round(transcodeJobs[id].avgFps * transcodeJobs[id].duration);
-												const remainingFrames = Math.max(0, estTotal - p.frames);
-												eta = Math.round(remainingFrames / (p.currentFps || transcodeJobs[id].avgFps || 1));
-											}
-											transcodeJobs[id].eta = (eta === null) ? null : eta;
-										} catch (e) { transcodeJobs[id].eta = null; }
-										// push update to websocket subscribers
-										try { broadcastStatus(id); } catch (e) { }
-									})
-									.on('error', (err) => { transcodeJobs[id].status = 'error'; transcodeJobs[id].message = err && err.message ? err.message : String(err); console.error('[transcode-error]', id, transcodeJobs[id].message); try { broadcastStatus(id); } catch (e){}; reject(err); })
-									.on('end', () => { transcodeJobs[id].status = 'done'; transcodeJobs[id].progress = 100; transcodeJobs[id].message = 'finished'; console.debug('[transcode]', id, 'done'); try { broadcastStatus(id); } catch (e){}; resolve(); })
-									.save(convertedPath);
-							});
-						});
-
-						// replace final file with converted one
-						try { fs.unlinkSync(finalPath); } catch (e) {}
-						finalName = convertedName;
-						finalPath = convertedPath;
-						finalExt = '.mp4';
-						converted = true;
-
-						// update metadata on disk
-						const d2 = readData();
-						if (d2[id]) {
-							d2[id].filename = finalName;
-							d2[id].mime = mime.lookup(finalPath) || d2[id].mime;
-							d2[id].size = fs.statSync(finalPath).size;
-							d2[id].converted = true;
-							writeData(d2);
-						}
-					} catch (err) {
-						transcodeJobs[id].status = 'error';
-						transcodeJobs[id].message = (err && err.message) || String(err);
-						console.error('Transcode error:', transcodeJobs[id].message);
-					}
-				})();
+								// update metadata on disk
+								const d2 = readData();
+								if (d2[id]) {
+									d2[id].filename = finalName;
+									d2[id].mime = mime.lookup(finalPath) || d2[id].mime;
+									d2[id].size = fs.statSync(finalPath).size;
+									d2[id].converted = true;
+									writeData(d2);
+								}
+								transcodeJobs[id].status = 'done';
+								transcodeJobs[id].progress = 100;
+								transcodeJobs[id].message = 'finished';
+								try { broadcastStatus(id); } catch (e) {}
+							} catch (err) {
+								transcodeJobs[id].status = 'error';
+								transcodeJobs[id].message = (err && err.message) || String(err);
+								console.error('Transcode error:', transcodeJobs[id].message);
+								try { broadcastStatus(id); } catch (e) {}
+							}
+						})();
 			}
 
 		const stat = fs.statSync(finalPath);
