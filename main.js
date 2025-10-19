@@ -15,6 +15,8 @@ const app = express();
 const upload = multer({ dest: UPLOADS_DIR });
 
 const ffmpeg = require('fluent-ffmpeg');
+const http = require('http');
+const WebSocket = require('ws');
 let ffmpegPath;
 try {
 	ffmpegPath = require('ffmpeg-static');
@@ -22,6 +24,18 @@ try {
 } catch (e) {
 	// ffmpeg-static not installed or failed; fluent-ffmpeg will try to use system ffmpeg
 	ffmpegPath = null;
+}
+
+// try to set ffprobe too (ffprobe-static provides a bundled binary); fluent-ffmpeg
+// will otherwise try to find a system ffprobe. If ffprobe isn't available, duration
+// detection will be unreliable and progress percent can't be computed from timemark.
+try {
+	const ffprobeStatic = require('ffprobe-static');
+	if (ffprobeStatic && ffprobeStatic.path) {
+		ffmpeg.setFfprobePath(ffprobeStatic.path);
+	}
+} catch (e) {
+	// not fatal; we'll attempt to continue and fall back to any percent provided by ffmpeg
 }
 
 function transcodeToMp4(inputPath, outputPath) {
@@ -93,16 +107,107 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 				(async () => {
 					transcodeJobs[id].status = 'running';
 					transcodeJobs[id].message = 'starting';
+					try { broadcastStatus(id); } catch (e) {}
 					try {
-						// listen to progress via ffmpeg; fluent-ffmpeg emits 'progress' events
+						// Use ffprobe to get duration, then compute percent from timemark in progress events
+						const parseTimemark = (tm) => {
+							// timemark like "00:01:23.45" -> seconds
+							if (!tm) return 0;
+							const parts = tm.split(':').map(Number);
+							if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
+							if (parts.length === 2) return parts[0]*60 + parts[1];
+							return Number(tm) || 0;
+						};
+
 						await new Promise((resolve, reject) => {
-							ffmpeg(finalPath)
-								.outputOptions(['-y', '-c:v libx264', '-preset veryfast', '-crf 23', '-c:a aac', '-b:a 128k'])
-								.on('start', (cmd) => { transcodeJobs[id].message = 'started'; })
-								.on('progress', (p) => { transcodeJobs[id].progress = Math.round(p.percent || 0); transcodeJobs[id].message = 'running'; })
-								.on('error', (err) => { transcodeJobs[id].status = 'error'; transcodeJobs[id].message = err.message || String(err); reject(err); })
-								.on('end', () => { transcodeJobs[id].status = 'done'; transcodeJobs[id].progress = 100; transcodeJobs[id].message = 'finished'; resolve(); })
-								.save(convertedPath);
+							// Probe for duration but handle probe errors gracefully
+							ffmpeg.ffprobe(finalPath, (err, meta) => {
+								let duration = 0;
+								let totalFrames = 0;
+								let avgFps = 0;
+								// get duration and frame info from ffprobe metadata
+								if (err) {
+									console.warn('ffprobe failed for', finalPath, err && err.message ? err.message : err);
+								} else if (meta && meta.format && meta.format.duration) {
+									duration = meta.format.duration;
+									// try to read stream-level info
+									if (meta.streams && meta.streams.length) {
+										const s0 = meta.streams[0];
+										if (s0.nb_frames) totalFrames = Number(s0.nb_frames) || 0;
+										if (s0.avg_frame_rate && typeof s0.avg_frame_rate === 'string') {
+											const parts = s0.avg_frame_rate.split('/').map(Number);
+											if (parts.length === 2 && parts[1]) avgFps = parts[0] / parts[1];
+										}
+									}
+								} else if (meta && meta.streams && meta.streams.length) {
+									// try to derive duration from the first stream if available
+									for (const s of meta.streams) {
+										if (s.duration) { duration = Number(s.duration); break; }
+										if (s.tags && s.tags.DURATION) { duration = Number(s.tags.DURATION); break; }
+									}
+									const s0 = meta.streams[0];
+									if (s0) {
+										if (s0.nb_frames) totalFrames = Number(s0.nb_frames) || 0;
+										if (s0.avg_frame_rate && typeof s0.avg_frame_rate === 'string') {
+											const parts = s0.avg_frame_rate.split('/').map(Number);
+											if (parts.length === 2 && parts[1]) avgFps = parts[0] / parts[1];
+										}
+									}
+								}
+								transcodeJobs[id].duration = duration || 0;
+								transcodeJobs[id].totalFrames = totalFrames || 0;
+								transcodeJobs[id].avgFps = avgFps || 0;
+								console.debug('[ffprobe]', id, 'duration=', transcodeJobs[id].duration, 'totalFrames=', transcodeJobs[id].totalFrames, 'avgFps=', transcodeJobs[id].avgFps);
+								try { broadcastStatus(id); } catch (e) {}
+
+								const proc = ffmpeg(finalPath)
+									.outputOptions(['-y', '-c:v libx264', '-preset veryfast', '-crf 23', '-c:a aac', '-b:a 128k'])
+									.on('start', (cmd) => { transcodeJobs[id].message = 'started'; console.debug('[transcode]', id, 'start'); })
+									.on('progress', (p) => {
+										// log progress for debugging
+										console.debug('[transcode-progress]', id, JSON.stringify(p));
+										let percent = 0;
+										// prefer timemark/duration when available
+										if (p && p.timemark && transcodeJobs[id].duration) {
+											const secs = parseTimemark(p.timemark);
+											if (transcodeJobs[id].duration > 0) percent = Math.round((secs / transcodeJobs[id].duration) * 100);
+										}
+										// fluent-ffmpeg sometimes provides p.percent; use it as fallback
+										if ((!percent || percent === 0) && typeof p.percent === 'number') {
+											percent = Math.round(p.percent);
+										}
+										// final fallback: use frames/targetSize heuristics if present
+										if ((!percent || percent === 0) && p && p.frames && p.targetSize) {
+											// naive heuristic - not accurate but better than 0
+											percent = Math.min(99, Math.round((p.frames % 1000) / 1000 * 100));
+										}
+										// clamp
+										percent = Math.min(100, Math.max(0, percent || 0));
+										transcodeJobs[id].progress = percent;
+										transcodeJobs[id].message = 'running';
+										// compute server-side ETA using currentFps + totalFrames when possible
+										try {
+											let eta = null; // seconds remaining
+											if (p && typeof p.currentFps === 'number' && typeof p.frames === 'number' && transcodeJobs[id].totalFrames && transcodeJobs[id].totalFrames > 0) {
+												const remainingFrames = Math.max(0, transcodeJobs[id].totalFrames - p.frames);
+												const fps = p.currentFps || transcodeJobs[id].avgFps || 1;
+												eta = Math.round(remainingFrames / (fps || 1));
+											} else if (transcodeJobs[id].duration && transcodeJobs[id].elapsed) {
+												eta = Math.max(0, Math.round(transcodeJobs[id].duration - transcodeJobs[id].elapsed));
+											} else if (p && typeof p.currentFps === 'number' && typeof p.frames === 'number' && transcodeJobs[id].avgFps && transcodeJobs[id].avgFps > 0 && transcodeJobs[id].duration) {
+												const estTotal = Math.round(transcodeJobs[id].avgFps * transcodeJobs[id].duration);
+												const remainingFrames = Math.max(0, estTotal - p.frames);
+												eta = Math.round(remainingFrames / (p.currentFps || transcodeJobs[id].avgFps || 1));
+											}
+											transcodeJobs[id].eta = (eta === null) ? null : eta;
+										} catch (e) { transcodeJobs[id].eta = null; }
+										// push update to websocket subscribers
+										try { broadcastStatus(id); } catch (e) { }
+									})
+									.on('error', (err) => { transcodeJobs[id].status = 'error'; transcodeJobs[id].message = err && err.message ? err.message : String(err); console.error('[transcode-error]', id, transcodeJobs[id].message); try { broadcastStatus(id); } catch (e){}; reject(err); })
+									.on('end', () => { transcodeJobs[id].status = 'done'; transcodeJobs[id].progress = 100; transcodeJobs[id].message = 'finished'; console.debug('[transcode]', id, 'done'); try { broadcastStatus(id); } catch (e){}; resolve(); })
+									.save(convertedPath);
+							});
 						});
 
 						// replace final file with converted one
@@ -202,8 +307,57 @@ app.get('/v/:id', (req, res) => {
 	}
 });
 
+// create http server so we can attach WebSocket server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = http.createServer(app);
+
+// WebSocket server for realtime transcode updates
+const wss = new WebSocket.Server({ server });
+// subscribers: id -> Set of ws
+const subscribers = new Map();
+
+function broadcastStatus(id) {
+	const set = subscribers.get(id);
+	if (!set) return;
+	const job = transcodeJobs[id] || { status: 'none' };
+	const msg = JSON.stringify({ type: 'status', id, job });
+	for (const ws of set) {
+		try {
+			if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+		} catch (e) {
+			// ignore send errors; individual sockets will be cleaned on close
+		}
+	}
+}
+
+wss.on('connection', (ws, req) => {
+	ws.on('message', (msg) => {
+		try {
+			const data = JSON.parse(msg.toString());
+			if (data && data.type === 'subscribe' && data.id) {
+				let set = subscribers.get(data.id);
+				if (!set) { set = new Set(); subscribers.set(data.id, set); }
+				set.add(ws);
+				ws._subscribedId = data.id;
+				// send current job state immediately
+				const job = transcodeJobs[data.id] || { status: 'none' };
+				ws.send(JSON.stringify({ type: 'status', id: data.id, job }));
+			}
+			if (data && data.type === 'unsubscribe' && data.id) {
+				const set = subscribers.get(data.id);
+				if (set) set.delete(ws);
+			}
+		} catch (e) { /* ignore */ }
+	});
+	ws.on('close', () => {
+		if (ws._subscribedId) {
+			const set = subscribers.get(ws._subscribedId);
+			if (set) set.delete(ws);
+		}
+	});
+});
+
+server.listen(PORT, () => {
 	console.log(`Server listening on http://localhost:${PORT}`);
 });
 
@@ -268,6 +422,18 @@ app.get('/transcode-status/:id', (req, res) => {
 	const job = transcodeJobs[id];
 	if (!job) return res.json({ status: 'none' });
 	return res.json(job);
+});
+
+// Return stored info and generated URLs for a given id
+app.get('/info/:id', (req, res) => {
+	const id = req.params.id;
+	const d = readData();
+	if (!d[id]) return res.status(404).json({ error: 'not found' });
+	const protocol = req.protocol;
+	const host = req.get('host');
+	const videoUrl = `${protocol}://${host}/v/${id}`;
+	const shortUrl = `${protocol}://${host}/s/${id}`;
+	return res.json({ id, videoUrl, shortUrl, info: d[id] });
 });
 
 // Serve a simple placeholder PNG (1x1 transparent or small image). We'll serve a tiny embedded PNG.
