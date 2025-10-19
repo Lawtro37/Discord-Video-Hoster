@@ -510,12 +510,16 @@ function sendInvalidEmbed(req, res) {
 	const protocol = req.protocol;
 	const imgUrl = `${protocol}://${host}/invalid.png`;
 	// Provide only the image meta so Discord will preferably show an image-only embed.
+	// Also include a lightweight in-page <img> with CSS to avoid borders on some mobile clients.
 	const html = `<!doctype html><html><head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width,initial-scale=1" />
 		<meta property="og:image" content="${imgUrl}" />
 		<meta property="og:image:type" content="image/png" />
 		<meta name="twitter:card" content="summary_large_image" />
 		<link rel="image_src" href="${imgUrl}" />
-		</head><body></body></html>`;
+		<style>html,body{margin:0;padding:0;background:#fff}img{border:0!important;display:block!important;width:100%!important;height:auto!important;}</style>
+		</head><body><img src="${imgUrl}" alt="" /></body></html>`;
 	res.setHeader('Content-Type', 'text/html');
 	res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
 	res.status(200).send(html);
