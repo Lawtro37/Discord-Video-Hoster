@@ -35,6 +35,9 @@ function transcodeToMp4(inputPath, outputPath) {
 	});
 }
 
+// in-memory transcode job tracking
+const transcodeJobs = {}; // id -> { status, progress, message }
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -77,24 +80,54 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 		let warning = null;
 
 		// If not a supported container, try converting to mp4
-		const supportedExts = new Set(['.mp4', '.mov', '.webm']);
-		if (!supportedExts.has(finalExt)) {
-			const convertedName = id + '.mp4';
-			const convertedPath = path.join(UPLOADS_DIR, convertedName);
-			try {
-				await transcodeToMp4(finalPath, convertedPath);
-				// replace final file with converted one
-				try { fs.unlinkSync(finalPath); } catch (e) {}
-				finalName = convertedName;
-				finalPath = convertedPath;
-				finalExt = '.mp4';
-				converted = true;
-			} catch (err) {
-				// conversion failed; keep original but include a warning
-				warning = 'Conversion failed or ffmpeg not available; original file kept';
-				console.error('Transcode error:', err && err.message ? err.message : err);
+		// Allow .mkv as a served format (many MKV files will still depend on codecs for playback)
+		const supportedExts = new Set(['.mp4', '.mov', '.webm', '.mkv']);
+			if (!supportedExts.has(finalExt)) {
+				// schedule an asynchronous transcode job and return immediately. Clients can poll /transcode-status/:id
+				const convertedName = id + '.mp4';
+				const convertedPath = path.join(UPLOADS_DIR, convertedName);
+				converted = false;
+				transcodeJobs[id] = { status: 'queued', progress: 0, message: 'queued' };
+
+				// run conversion in background
+				(async () => {
+					transcodeJobs[id].status = 'running';
+					transcodeJobs[id].message = 'starting';
+					try {
+						// listen to progress via ffmpeg; fluent-ffmpeg emits 'progress' events
+						await new Promise((resolve, reject) => {
+							ffmpeg(finalPath)
+								.outputOptions(['-y', '-c:v libx264', '-preset veryfast', '-crf 23', '-c:a aac', '-b:a 128k'])
+								.on('start', (cmd) => { transcodeJobs[id].message = 'started'; })
+								.on('progress', (p) => { transcodeJobs[id].progress = Math.round(p.percent || 0); transcodeJobs[id].message = 'running'; })
+								.on('error', (err) => { transcodeJobs[id].status = 'error'; transcodeJobs[id].message = err.message || String(err); reject(err); })
+								.on('end', () => { transcodeJobs[id].status = 'done'; transcodeJobs[id].progress = 100; transcodeJobs[id].message = 'finished'; resolve(); })
+								.save(convertedPath);
+						});
+
+						// replace final file with converted one
+						try { fs.unlinkSync(finalPath); } catch (e) {}
+						finalName = convertedName;
+						finalPath = convertedPath;
+						finalExt = '.mp4';
+						converted = true;
+
+						// update metadata on disk
+						const d2 = readData();
+						if (d2[id]) {
+							d2[id].filename = finalName;
+							d2[id].mime = mime.lookup(finalPath) || d2[id].mime;
+							d2[id].size = fs.statSync(finalPath).size;
+							d2[id].converted = true;
+							writeData(d2);
+						}
+					} catch (err) {
+						transcodeJobs[id].status = 'error';
+						transcodeJobs[id].message = (err && err.message) || String(err);
+						console.error('Transcode error:', transcodeJobs[id].message);
+					}
+				})();
 			}
-		}
 
 		const stat = fs.statSync(finalPath);
 
@@ -227,6 +260,14 @@ app.post('/post-webhook', express.json(), async (req, res) => {
 	} catch (err) {
 		return res.status(500).json({ error: err.message });
 	}
+});
+
+// Endpoint to check transcode status
+app.get('/transcode-status/:id', (req, res) => {
+	const id = req.params.id;
+	const job = transcodeJobs[id];
+	if (!job) return res.json({ status: 'none' });
+	return res.json(job);
 });
 
 // Serve a simple placeholder PNG (1x1 transparent or small image). We'll serve a tiny embedded PNG.
