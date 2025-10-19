@@ -21,7 +21,7 @@
   <body>
     <h1>Discord Video Hoster</h1>
     <div class="drop" id="drop">Drop a video here or select one</div>
-    <input id="file" type="file" accept="video/*" />
+  <input id="file" type="file" accept="video/*,.mkv" />
   <p class="note"><strong>note:</strong> links and files are cleared when the server restarts</p>
     <div style="margin-top:5px">
       <label for="label">Custom label (used for Markdown/HTML/embed): </label>
@@ -46,18 +46,57 @@
         if (f) upload(f);
       });
 
-      async function upload(file){
-        links.innerHTML = 'Uploading...';
+      function createProgressUI(){
+        links.innerHTML = '';
+        const pcont = document.createElement('div');
+        pcont.style.marginTop = '8px';
+        const bar = document.createElement('progress');
+        bar.max = 100;
+        bar.value = 0;
+        bar.style.width = '100%';
+        const pct = document.createElement('div');
+        pct.textContent = '0%';
+        pct.style.textAlign = 'right';
+        pct.style.fontSize = '12px';
+        pct.style.marginTop = '4px';
+        pcont.appendChild(bar);
+        pcont.appendChild(pct);
+        links.appendChild(pcont);
+        return { bar, pct };
+      }
+
+      function upload(file){
         const fd = new FormData();
         fd.append('file', file);
-        try{
-          const res = await fetch('/upload', { method:'POST', body: fd });
-          const j = await res.json();
-          if (j.error) { links.textContent = 'Error: ' + j.error; return; }
-          renderResults(j);
-        }catch(err){
-          links.textContent = 'Upload failed: ' + err;
-        }
+        const ui = createProgressUI();
+
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/upload');
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable) {
+            const percent = Math.round((ev.loaded / ev.total) * 100);
+            ui.bar.value = percent;
+            ui.pct.textContent = percent + '%';
+          }
+        };
+        xhr.onreadystatechange = () => {
+          if (xhr.readyState === 4) {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try{
+                const j = JSON.parse(xhr.responseText);
+                  renderResults(j);
+                  // if server returned converted=false or job may be running, poll transcode status
+                  pollTranscode(j.id);
+              }catch(e){
+                links.textContent = 'Upload finished but response parse failed';
+              }
+            } else {
+              links.textContent = 'Upload failed: ' + xhr.status + ' ' + xhr.statusText + '\n' + xhr.responseText;
+            }
+          }
+        };
+        xhr.onerror = () => { links.textContent = 'Upload failed (network error)'; };
+        xhr.send(fd);
       }
 
       function makeFormats(url, label){
@@ -149,6 +188,12 @@
 
         links.appendChild(list);
 
+  // area for conversion progress
+  const convDiv = document.createElement('div');
+  convDiv.id = 'conv-status-' + j.id;
+  convDiv.style.marginTop = '10px';
+  links.appendChild(convDiv);
+
         // webhook UI
         const whDiv = document.createElement('div');
         whDiv.style.marginTop = '12px';
@@ -199,6 +244,34 @@
           const vals = [newFormats.direct, newFormats.angle, newFormats.spoiler, newFormats.markdown, newFormats.html, newFormats.webhookJSON];
           tas.forEach((t,i)=> t.textContent = vals[i]);
         };
+      }
+
+      let transcodePoller = null;
+      function pollTranscode(id){
+        const convDiv = document.getElementById('conv-status-' + id);
+        if (!convDiv) return;
+        // clear any existing
+        if (transcodePoller) clearInterval(transcodePoller);
+        transcodePoller = setInterval(async ()=>{
+          try{
+            const r = await fetch('/transcode-status/' + id);
+            const j = await r.json();
+            if (j.status === 'none') { convDiv.textContent = ''; clearInterval(transcodePoller); transcodePoller = null; return; }
+            if (j.status === 'queued' || j.status === 'running'){
+              convDiv.innerHTML = `<div style="font-weight:600">Converting: ${j.progress || 0}%</div>`;
+            } else if (j.status === 'done'){
+              convDiv.innerHTML = `<div style="font-weight:600">Conversion finished</div>`;
+              clearInterval(transcodePoller); transcodePoller = null;
+              // reload the page's info (fetch updated data) — simply refresh the current results by hitting /v/:id as video src is same
+            } else if (j.status === 'error'){
+              convDiv.innerHTML = `<div style="color:crimson">Conversion error: ${j.message}</div>`;
+              clearInterval(transcodePoller); transcodePoller = null;
+            }
+          }catch(e){
+            convDiv.innerHTML = `<div style="color:crimson">Conversion status check failed</div>`;
+            clearInterval(transcodePoller); transcodePoller = null;
+          }
+        }, 1500);
       }
     </script>
   </body>
