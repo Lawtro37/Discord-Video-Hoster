@@ -124,7 +124,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 app.get('/s/:id', (req, res) => {
 	const id = req.params.id;
 	const d = readData();
-	if (!d[id]) return res.status(404).send('Not found');
+	if (!d[id]) return sendInvalidEmbed(req, res);
 	res.redirect(`/v/${id}`);
 });
 
@@ -132,10 +132,10 @@ app.get('/s/:id', (req, res) => {
 app.get('/v/:id', (req, res) => {
 	const id = req.params.id;
 	const d = readData();
-	if (!d[id]) return res.status(404).send('Not found');
+	if (!d[id]) return sendInvalidEmbed(req, res);
 
 	const filePath = path.join(UPLOADS_DIR, d[id].filename);
-	if (!fs.existsSync(filePath)) return res.status(404).send('File missing');
+	if (!fs.existsSync(filePath)) return sendInvalidEmbed(req, res);
 
 	const stat = fs.statSync(filePath);
 	const fileSize = stat.size;
@@ -228,3 +228,42 @@ app.post('/post-webhook', express.json(), async (req, res) => {
 		return res.status(500).json({ error: err.message });
 	}
 });
+
+// Serve a simple placeholder PNG (1x1 transparent or small image). We'll serve a tiny embedded PNG.
+app.get('/invalid.png', (req, res) => {
+	// Prefer the workspace image at public/Invalid.png (case-sensitive on some systems)
+	const candidate = path.join(__dirname, 'public', 'Invalid.png');
+	if (fs.existsSync(candidate)) {
+		res.setHeader('Content-Type', 'image/png');
+		// let caches revalidate quickly
+		res.setHeader('Cache-Control', 'public, max-age=60');
+		const stream = fs.createReadStream(candidate);
+		return stream.pipe(res);
+	}
+
+	// Fallback: tiny 1x1 transparent PNG (base64)
+	const png = Buffer.from(
+		'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII=',
+		'base64'
+	);
+	res.setHeader('Content-Type', 'image/png');
+	res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+	res.send(png);
+});
+
+function sendInvalidEmbed(req, res) {
+	// Return a minimal HTML page with Open Graph tags so Discord will create an embed with the image
+	const host = req.get('host');
+	const protocol = req.protocol;
+	const imgUrl = `${protocol}://${host}/invalid.png`;
+	// Provide only the image meta so Discord will preferably show an image-only embed.
+	const html = `<!doctype html><html><head>
+		<meta property="og:image" content="${imgUrl}" />
+		<meta property="og:image:type" content="image/png" />
+		<meta name="twitter:card" content="summary_large_image" />
+		<link rel="image_src" href="${imgUrl}" />
+		</head><body></body></html>`;
+	res.setHeader('Content-Type', 'text/html');
+	res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+	res.status(200).send(html);
+}
